@@ -27,11 +27,17 @@ from urllib.error import URLError, HTTPError
 # Quip API client (no external dependencies)
 # ---------------------------------------------------------------------------
 
+CIRCUIT_BREAKER_THRESHOLD = 5   # consecutive final failures before pausing
+CIRCUIT_BREAKER_PAUSE     = 180  # seconds to wait when tripped
+RETRY_WAITS               = [5, 15, 30]  # seconds between attempts
+
+
 class QuipClient:
     BASE_URL = "https://platform.quip.com/1"
 
     def __init__(self, token: str):
         self.token = token
+        self._consecutive_failures = 0
 
     def _get(self, path: str, params: dict = None) -> dict:
         url = f"{self.BASE_URL}/{path}"
@@ -39,15 +45,37 @@ class QuipClient:
             query = "&".join(f"{k}={v}" for k, v in params.items())
             url = f"{url}?{query}"
         req = Request(url, headers={"Authorization": f"Bearer {self.token}"})
-        try:
-            with urlopen(req, timeout=30) as resp:
-                return json.loads(resp.read().decode())
-        except HTTPError as e:
-            print(f"  [HTTP {e.code}] {path}: {e.reason}", file=sys.stderr)
-            return {}
-        except URLError as e:
-            print(f"  [Network error] {path}: {e.reason}", file=sys.stderr)
-            return {}
+        for attempt, wait in enumerate(RETRY_WAITS):
+            try:
+                with urlopen(req, timeout=30) as resp:
+                    self._consecutive_failures = 0
+                    return json.loads(resp.read().decode())
+            except HTTPError as e:
+                if e.code in (429, 503) and attempt < len(RETRY_WAITS) - 1:
+                    print(f"  [HTTP {e.code}] {path}: {e.reason} — retrying in {wait}s", file=sys.stderr)
+                    time.sleep(wait)
+                    continue
+                print(f"  [HTTP {e.code}] {path}: {e.reason}", file=sys.stderr)
+                if e.code in (429, 503):
+                    self._consecutive_failures += 1
+                    self._maybe_pause()
+                return {}
+            except URLError as e:
+                if attempt < len(RETRY_WAITS) - 1:
+                    print(f"  [Network error] {path}: {e.reason} — retrying in {wait}s", file=sys.stderr)
+                    time.sleep(wait)
+                    continue
+                print(f"  [Network error] {path}: {e.reason}", file=sys.stderr)
+                self._consecutive_failures += 1
+                self._maybe_pause()
+                return {}
+        return {}
+
+    def _maybe_pause(self):
+        if self._consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD:
+            print(f"\n  ⚠️  {self._consecutive_failures} consecutive failures — pausing {CIRCUIT_BREAKER_PAUSE}s to let the server recover...", file=sys.stderr)
+            time.sleep(CIRCUIT_BREAKER_PAUSE)
+            self._consecutive_failures = 0
 
     def get_authenticated_user(self) -> dict:
         return self._get("users/current")
@@ -62,18 +90,27 @@ class QuipClient:
         """Export a thread as Markdown via the Quip export endpoint."""
         url = f"{self.BASE_URL}/threads/{thread_id}/export/markdown"
         req = Request(url, headers={"Authorization": f"Bearer {self.token}"})
-        try:
-            with urlopen(req, timeout=60) as resp:
-                return resp.read().decode("utf-8")
-        except HTTPError as e:
-            # Fall back to HTML-based extraction if markdown export unavailable
-            if e.code == 404:
+        for attempt in range(3):
+            try:
+                with urlopen(req, timeout=60) as resp:
+                    return resp.read().decode("utf-8")
+            except HTTPError as e:
+                # 400/404 = endpoint not supported for this doc type; fall back silently
+                if e.code in (400, 404):
+                    return None
+                if e.code in (429, 503) and attempt < 2:
+                    wait = 2 ** (attempt + 1)
+                    time.sleep(wait)
+                    continue
+                print(f"  [HTTP {e.code}] export markdown: {e.reason}", file=sys.stderr)
                 return None
-            print(f"  [HTTP {e.code}] export markdown: {e.reason}", file=sys.stderr)
-            return None
-        except URLError as e:
-            print(f"  [Network error] export markdown: {e.reason}", file=sys.stderr)
-            return None
+            except URLError as e:
+                if attempt < 2:
+                    time.sleep(2 ** (attempt + 1))
+                    continue
+                print(f"  [Network error] export markdown: {e.reason}", file=sys.stderr)
+                return None
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -305,7 +342,7 @@ def traverse_folder(client: QuipClient, folder_id: str, dest_dir: Path,
             type_ = thread.get("thread", {}).get("type", "")
             if type_ in ("document", "spreadsheet", "slides", ""):
                 export_thread(client, thread_id, title, dest_dir, token, stats)
-                time.sleep(0.3)  # be polite to the API
+                time.sleep(0.75)  # be polite to the API
 
         elif subfolder_id:
             sub_folder = client.get_folder(subfolder_id)
